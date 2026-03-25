@@ -8,7 +8,7 @@ This repository contains a Chrome extension that automates two actions on [clear
 ## Features
 
 - Detects whether the user appears logged in before running actions.
-- Crawls product listing pages and opens free items in background tabs to add them to cart.
+- Crawls the Roblox product catalog page (`/shop/roblox/roblox-games`) with pagination, opens each product page in a background tab, and adds only free items to cart.
 - Crawls purchased library pages and triggers downloads for every detected asset link.
 - Includes a popup UI with two buttons:
   - `Add all free products to cart`
