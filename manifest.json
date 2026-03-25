@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "ClearlyDev Free Downloader",
+  "description": "Add all free products to cart and download all purchased assets from clearlydev.com",
+  "version": "1.0.0",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "downloads",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://clearlydev.com/*",
+    "https://www.clearlydev.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "ClearlyDev Free Downloader",
+    "default_popup": "src/popup.html"
+  }
+}
