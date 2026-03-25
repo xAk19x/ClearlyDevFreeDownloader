@@ -1,6 +1,7 @@
 const BASE_URLS = ['https://clearlydev.com', 'https://www.clearlydev.com'];
-const PRODUCT_LIST_PATHS = ['/assets', '/products', '/shop'];
+const PRODUCT_LIST_START_PATHS = ['/shop/roblox/roblox-games', '/shop', '/assets', '/products'];
 const LIBRARY_PATHS = ['/library', '/my-account/downloads', '/downloads'];
+const MAX_LISTING_PAGES = 25;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.action === 'addFreeProductsToCart') {
@@ -27,33 +28,37 @@ async function runAddFreeProductsFlow() {
     throw new Error('You appear to be logged out. Please sign in on clearlydev.com first.');
   }
 
-  const productUrls = await collectProductUrls();
+  const productUrls = await collectProductUrlsFromListingPagination();
   if (!productUrls.length) {
-    throw new Error('Could not find product links on known catalog pages.');
+    throw new Error('No product links found on the shop pages.');
   }
 
-  const freeProducts = [];
+  let addedCount = 0;
+
   for (const url of productUrls) {
     const tabId = await createInactiveTab(url);
     try {
       await waitForTabLoaded(tabId);
       const pageInfo = await runOnTab(tabId, extractProductPageInfo);
-      if (pageInfo?.isFree && pageInfo?.addToCartSelector) {
-        const clicked = await runOnTab(tabId, clickElementBySelector, [pageInfo.addToCartSelector]);
-        if (clicked) {
-          freeProducts.push(pageInfo.title || url);
-        }
+
+      if (!pageInfo?.isFree || !pageInfo?.addToCartSelector) {
+        continue;
+      }
+
+      const clicked = await runOnTab(tabId, clickElementBySelector, [pageInfo.addToCartSelector]);
+      if (clicked) {
+        addedCount += 1;
       }
     } finally {
       await chrome.tabs.remove(tabId);
     }
   }
 
-  if (!freeProducts.length) {
-    return 'No free products with an add-to-cart button were detected.';
+  if (!addedCount) {
+    return `Scanned ${productUrls.length} product page(s), but none matched free + add-to-cart.`;
   }
 
-  return `Added ${freeProducts.length} free product(s) to cart.`;
+  return `Scanned ${productUrls.length} product page(s). Added ${addedCount} free product(s) to cart.`;
 }
 
 async function runDownloadAllFlow() {
@@ -103,27 +108,45 @@ async function checkLoggedIn() {
   }
 }
 
-async function collectProductUrls() {
-  const all = new Set();
+async function collectProductUrlsFromListingPagination() {
+  const discoveredProductUrls = new Set();
+  const visitedListingPages = new Set();
+  const pendingListingPages = [];
 
-  for (const path of PRODUCT_LIST_PATHS) {
-    const tabId = await openFirstWorkingPage([path]);
-    if (!tabId) {
+  for (const base of BASE_URLS) {
+    for (const path of PRODUCT_LIST_START_PATHS) {
+      pendingListingPages.push(`${base}${path}`);
+    }
+  }
+
+  while (pendingListingPages.length && visitedListingPages.size < MAX_LISTING_PAGES) {
+    const listingUrl = pendingListingPages.shift();
+    if (!listingUrl || visitedListingPages.has(listingUrl)) {
       continue;
     }
 
+    visitedListingPages.add(listingUrl);
+
+    const tabId = await createInactiveTab(listingUrl);
     try {
       await waitForTabLoaded(tabId);
-      const links = await runOnTab(tabId, collectProductLinksFromListing);
-      for (const link of links) {
-        all.add(link);
+      const listingData = await runOnTab(tabId, collectListingPageData);
+
+      for (const productUrl of listingData.productUrls || []) {
+        discoveredProductUrls.add(productUrl);
+      }
+
+      for (const nextPageUrl of listingData.nextPageUrls || []) {
+        if (!visitedListingPages.has(nextPageUrl)) {
+          pendingListingPages.push(nextPageUrl);
+        }
       }
     } finally {
       await chrome.tabs.remove(tabId);
     }
   }
 
-  return [...all];
+  return [...discoveredProductUrls];
 }
 
 async function openFirstWorkingPage(paths) {
@@ -131,10 +154,9 @@ async function openFirstWorkingPage(paths) {
     for (const path of paths) {
       const url = `${base}${path}`;
       try {
-        const tabId = await createInactiveTab(url);
-        return tabId;
+        return await createInactiveTab(url);
       } catch {
-        // Try next candidate URL.
+        // Ignore and continue candidates.
       }
     }
   }
@@ -143,11 +165,7 @@ async function openFirstWorkingPage(paths) {
 }
 
 async function createInactiveTab(url) {
-  const tab = await chrome.tabs.create({
-    url,
-    active: false
-  });
-
+  const tab = await chrome.tabs.create({ url, active: false });
   if (!tab.id) {
     throw new Error(`Failed to open tab for ${url}`);
   }
@@ -170,7 +188,17 @@ function waitForTabLoaded(tabId, timeoutMs = 20000) {
       }
     };
 
-    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status === 'complete') {
+        clearTimeout(timeout);
+        resolve();
+        return;
+      }
+      chrome.tabs.onUpdated.addListener(listener);
+    }).catch((error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
   });
 }
 
@@ -198,19 +226,49 @@ function detectLoginStatusOnPage() {
   return !hasLoginForm;
 }
 
-function collectProductLinksFromListing() {
-  const anchors = [...document.querySelectorAll('a[href]')];
-  const productLinks = anchors
-    .map((a) => a.href)
-    .filter(Boolean)
-    .filter((href) => /\/product\//i.test(href) || /\/assets\//i.test(href));
+function collectListingPageData() {
+  const normalize = (href) => {
+    try {
+      const parsed = new URL(href, window.location.href);
+      parsed.hash = '';
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  };
 
-  return [...new Set(productLinks)];
+  const anchors = [...document.querySelectorAll('a[href]')];
+
+  const productUrls = anchors
+    .map((a) => normalize(a.getAttribute('href')))
+    .filter(Boolean)
+    .filter((href) => /\/product\//i.test(href));
+
+  const nextPageUrls = anchors
+    .filter((a) => {
+      const href = (a.getAttribute('href') || '').toLowerCase();
+      const rel = (a.getAttribute('rel') || '').toLowerCase();
+      const text = (a.textContent || '').toLowerCase();
+
+      return (
+        rel.includes('next') ||
+        text.includes('next') ||
+        href.includes('/page/') ||
+        href.includes('paged=')
+      );
+    })
+    .map((a) => normalize(a.getAttribute('href')))
+    .filter(Boolean)
+    .filter((href) => href.startsWith(window.location.origin));
+
+  return {
+    productUrls: [...new Set(productUrls)],
+    nextPageUrls: [...new Set(nextPageUrls)]
+  };
 }
 
 function extractProductPageInfo() {
   const bodyText = document.body?.innerText || '';
-  const title = document.querySelector('h1, .product_title, .entry-title')?.textContent?.trim() || document.title;
   const isFree = /(\$\s?0(?:\.00)?|free\b)/i.test(bodyText);
 
   const buttonCandidates = [
@@ -228,11 +286,11 @@ function extractProductPageInfo() {
     }
 
     const label = (node.textContent || '').toLowerCase();
-    return label.includes('add') || label.includes('cart') || node.getAttribute('href')?.includes('add-to-cart');
+    const href = (node.getAttribute('href') || '').toLowerCase();
+    return label.includes('add') || label.includes('cart') || href.includes('add-to-cart');
   });
 
   return {
-    title,
     isFree,
     addToCartSelector: addToCartSelector || null
   };
